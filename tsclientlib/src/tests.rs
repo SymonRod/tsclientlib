@@ -35,3 +35,277 @@ fn negative_iconid() { test_iconid("-96136942", 4198830354); }
 
 #[test]
 fn big_iconid() { test_iconid("18446744073225738240", 3811153920); }
+
+const STREAM_ID: &str = "f2f7de30-8488-4000-8000-000000000001";
+
+#[test]
+fn stream_started() {
+	let msg = parse_msg(&format!(
+		r"notifystreamstarted clid=1 id={} name=Wayland\sSource type=3 access=1 mode=1 bitrate=33920 viewer_limit=0 audio=0",
+		STREAM_ID
+	));
+	if let InMessage::StreamStarted(list) = msg {
+		assert_eq!(list.iter().count(), 1);
+		let part = list.iter().next().unwrap();
+		assert_eq!(part.client_id, ts_bookkeeping::ClientId(1));
+		assert_eq!(part.stream_id, STREAM_ID);
+		assert_eq!(part.name.as_deref(), Some("Wayland Source"));
+		assert_eq!(part.stream_type, Some(3));
+		assert_eq!(part.access, Some(1));
+		assert_eq!(part.mode, Some(1));
+		assert_eq!(part.bitrate, Some(33920));
+		assert_eq!(part.viewer_limit, Some(0));
+		assert_eq!(part.audio, Some(false));
+		assert_eq!(part.return_code, None);
+	} else {
+		panic!("Expected StreamStarted, got {:?}", msg);
+	}
+}
+
+#[test]
+fn stream_info_multiple_entries() {
+	let msg = parse_msg(&format!(
+		"notifystreaminfo return_code=info-1 clid=13 id={} name=Renamed type=2 accessibility=1 mode=1 viewer=1 bitrate=29104 viewer_limit=0 audio=0|clid=13 id=f2f7de30-8488-4000-8000-000000000002 name=Test type=3 accessibility=2 mode=1 viewer=0 bitrate=33920 viewer_limit=5 audio=1",
+		STREAM_ID
+	));
+	if let InMessage::StreamInfo(list) = msg {
+		let parts: Vec<_> = list.iter().collect();
+		assert_eq!(parts.len(), 2);
+		assert_eq!(parts[0].client_id, ts_bookkeeping::ClientId(13));
+		assert_eq!(parts[0].stream_id, STREAM_ID);
+		assert_eq!(parts[0].name.as_deref(), Some("Renamed"));
+		assert_eq!(parts[0].stream_type, Some(2));
+		assert_eq!(parts[0].accessibility, Some(1));
+		assert_eq!(parts[0].mode, Some(1));
+		assert_eq!(parts[0].viewer_count, Some(1));
+		assert_eq!(parts[0].bitrate, Some(29104));
+		assert_eq!(parts[0].viewer_limit, Some(0));
+		assert_eq!(parts[0].audio, Some(false));
+		assert_eq!(parts[0].return_code.as_deref(), Some("info-1"));
+		assert_eq!(parts[1].client_id, ts_bookkeeping::ClientId(13));
+		assert_eq!(parts[1].stream_id, "f2f7de30-8488-4000-8000-000000000002");
+		assert_eq!(parts[1].name.as_deref(), Some("Test"));
+		assert_eq!(parts[1].stream_type, Some(3));
+		assert_eq!(parts[1].accessibility, Some(2));
+		assert_eq!(parts[1].viewer_count, Some(0));
+		assert_eq!(parts[1].bitrate, Some(33920));
+		assert_eq!(parts[1].viewer_limit, Some(5));
+		assert_eq!(parts[1].audio, Some(true));
+	} else {
+		panic!("Expected StreamInfo, got {:?}", msg);
+	}
+}
+
+#[test]
+fn stream_updated_partial_fields() {
+	for patch in [
+		"",
+		" name=Renamed return_code=patch-1",
+		" name= audio=0",
+		" accessibility=2",
+		" access=1",
+		" type=99 mode=99 viewer=2 bitrate=750000 viewer_limit=5 audio=1",
+	] {
+		let msg = parse_msg(&format!("notifystreamupdated clid=13 id={}{}", STREAM_ID, patch));
+		if let InMessage::StreamUpdated(list) = msg {
+			let part = list.iter().next().unwrap();
+			assert_eq!(part.client_id, ts_bookkeeping::ClientId(13));
+			assert_eq!(part.stream_id, STREAM_ID);
+			assert_eq!(
+				part.name.as_deref(),
+				if patch.contains("Renamed") {
+					Some("Renamed")
+				} else if patch.contains("name=") {
+					Some("")
+				} else {
+					None
+				}
+			);
+			assert_eq!(part.access, if patch.contains("access=") { Some(1) } else { None });
+			assert_eq!(
+				part.accessibility,
+				if patch.contains("accessibility=") { Some(2) } else { None }
+			);
+			assert_eq!(
+				part.audio,
+				if patch.contains("audio=") { Some(patch.contains("audio=1")) } else { None }
+			);
+			assert_eq!(part.stream_type, if patch.contains("type=") { Some(99) } else { None });
+			assert_eq!(part.mode, if patch.contains("mode=") { Some(99) } else { None });
+			assert_eq!(part.viewer_count, if patch.contains("viewer=") { Some(2) } else { None });
+			assert_eq!(part.bitrate, if patch.contains("bitrate=") { Some(750000) } else { None });
+			assert_eq!(
+				part.viewer_limit,
+				if patch.contains("viewer_limit=") { Some(5) } else { None }
+			);
+			assert_eq!(
+				part.return_code.as_deref(),
+				if patch.contains("return_code=") { Some("patch-1") } else { None }
+			);
+		} else {
+			panic!("Expected StreamUpdated, got {:?}", msg);
+		}
+	}
+}
+
+#[test]
+fn stream_membership_and_stop() {
+	let msg = parse_msg(&format!("notifystreamclientjoined clid=10 id={}", STREAM_ID));
+	if let InMessage::StreamClientJoined(list) = msg {
+		let part = list.iter().next().unwrap();
+		assert_eq!(part.client_id, ts_bookkeeping::ClientId(10));
+		assert_eq!(part.stream_id, STREAM_ID);
+	} else {
+		panic!("Expected StreamClientJoined, got {:?}", msg);
+	}
+	for reason in ["", " reason=1", " reason=4", " reason=99"] {
+		for command in ["notifystreamstopped", "notifystreamclientleft"] {
+			let msg = parse_msg(&format!("{} clid=1 id={}{}", command, STREAM_ID, reason));
+			let (client_id, stream_id, parsed_reason) = match &msg {
+				InMessage::StreamStopped(list) => {
+					assert_eq!(command, "notifystreamstopped");
+					let part = list.iter().next().unwrap();
+					(part.client_id, &part.stream_id, part.reason)
+				}
+				InMessage::StreamClientLeft(list) => {
+					assert_eq!(command, "notifystreamclientleft");
+					let part = list.iter().next().unwrap();
+					(part.client_id, &part.stream_id, part.reason)
+				}
+				_ => panic!("Unexpected message {:?}", msg),
+			};
+			assert_eq!(client_id, ts_bookkeeping::ClientId(1));
+			assert_eq!(stream_id, STREAM_ID);
+			assert_eq!(
+				parsed_reason,
+				reason.strip_prefix(" reason=").map(|v| v.parse::<u32>().unwrap())
+			);
+		}
+	}
+}
+
+#[test]
+fn stream_join_response_offer_and_rejection() {
+	for message in ["msg", "msg="] {
+		let msg = parse_msg(&format!(
+			r"notifyrespondjoinstreamrequest clid=1 id={} {} decision=1 offer=v=0\r\no=-\s1\s2\sIN\sIP4\s127.0.0.1\r\na=x:\p\/\\s\r\n",
+			STREAM_ID, message
+		));
+		if let InMessage::RespondJoinStreamRequest(list) = msg {
+			let part = list.iter().next().unwrap();
+			assert_eq!(part.client_id, ts_bookkeeping::ClientId(1));
+			assert_eq!(part.stream_id, STREAM_ID);
+			assert_eq!(part.message.as_deref(), Some(""));
+			assert_eq!(part.decision, 1);
+			assert_eq!(
+				part.offer.as_deref(),
+				Some("v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\na=x:|/\\s\r\n")
+			);
+		} else {
+			panic!("Expected RespondJoinStreamRequest, got {:?}", msg);
+		}
+	}
+	for message in ["", " msg", " msg=Denied"] {
+		let msg = parse_msg(&format!(
+			"notifyrespondjoinstreamrequest clid=1 id={} decision=0{}",
+			STREAM_ID, message
+		));
+		if let InMessage::RespondJoinStreamRequest(list) = msg {
+			let part = list.iter().next().unwrap();
+			assert_eq!(part.decision, 0);
+			assert_eq!(part.offer, None);
+			assert_eq!(
+				part.message.as_deref(),
+				match message {
+					"" => None,
+					" msg" => Some(""),
+					_ => Some("Denied"),
+				}
+			);
+		} else {
+			panic!("Expected RespondJoinStreamRequest, got {:?}", msg);
+		}
+	}
+}
+
+#[test]
+fn stream_signaling_opaque_json() {
+	// TS3 decoding must leave JSON escapes intact for the application to parse once.
+	for (wire, decoded) in [
+		(
+			r#"{"args":{"mLine":0,"mid":"0","sdp":"candidate:1\styp\shost"},"cmd":"iceCandidate"}"#,
+			r#"{"args":{"mLine":0,"mid":"0","sdp":"candidate:1 typ host"},"cmd":"iceCandidate"}"#,
+		),
+		(
+			r#"{"cmd":"answer","args":{"answer":"v=0\\r\\na=x:\p\/\\\\s"}}"#,
+			r#"{"cmd":"answer","args":{"answer":"v=0\r\na=x:|/\\s"}}"#,
+		),
+		(r#"{"cmd":"bogusCommand","args":{}}"#, r#"{"cmd":"bogusCommand","args":{}}"#),
+		("not-json", "not-json"),
+	] {
+		let msg =
+			parse_msg(&format!("notifystreamsignaling clid=1 id={} json={}", STREAM_ID, wire));
+		if let InMessage::StreamSignaling(list) = msg {
+			let part = list.iter().next().unwrap();
+			assert_eq!(part.client_id, ts_bookkeeping::ClientId(1));
+			assert_eq!(part.stream_id, STREAM_ID);
+			assert_eq!(part.json, decoded);
+		} else {
+			panic!("Expected StreamSignaling, got {:?}", msg);
+		}
+	}
+}
+
+#[test]
+fn stream_viewer_outbound() {
+	use ts_bookkeeping::ClientId;
+	use ts_bookkeeping::messages::{OutMessageTrait, c2s};
+
+	for is_remove in [false, true] {
+		let packet = c2s::OutJoinStreamRequestPart {
+			stream_id: STREAM_ID.into(),
+			client_id: ClientId(1),
+			is_remove,
+			message: "".into(),
+		}
+		.to_packet();
+		// The existing serializer emits empty values as bare keys, not omitted keys.
+		assert_eq!(
+			packet.0.content(),
+			format!(
+				"joinstreamrequest id={} clid=1 is_remove={} msg",
+				STREAM_ID,
+				u8::from(is_remove)
+			)
+			.as_bytes()
+		);
+		let parsed = c2s::InMessage::new(&packet.0.header(), packet.0.content()).unwrap();
+		if let c2s::InMessage::JoinStreamRequest(list) = parsed {
+			let part = list.iter().next().unwrap();
+			assert_eq!(part.stream_id, STREAM_ID);
+			assert_eq!(part.client_id, ClientId(1));
+			assert_eq!(part.is_remove, is_remove);
+			assert_eq!(part.message, "");
+		} else {
+			panic!("Expected JoinStreamRequest, got {:?}", parsed);
+		}
+	}
+	for stream_id in [None, Some(STREAM_ID.into())] {
+		let packet =
+			c2s::OutRequestStreamInfoPart { client_id: ClientId(13), stream_id: stream_id.clone() }
+				.to_packet();
+		let expected = if stream_id.is_some() {
+			format!("requeststreaminfo clid=13 id={}", STREAM_ID)
+		} else {
+			"requeststreaminfo clid=13".into()
+		};
+		assert_eq!(packet.0.content(), expected.as_bytes());
+	}
+	let packet = c2s::OutStreamSignalingPart {
+		client_id: ClientId(1),
+		stream_id: STREAM_ID.into(),
+		json: r#"{"cmd":"answer","args":{"answer":"v=0\r\na=x:|/\\s space"}}"#.into(),
+	}
+	.to_packet();
+	assert_eq!(packet.0.content(), format!(r#"streamsignaling clid=1 id={} json={{"cmd":"answer","args":{{"answer":"v=0\\r\\na=x:\p\/\\\\s\sspace"}}}}"#, STREAM_ID).as_bytes());
+}
