@@ -309,3 +309,100 @@ fn stream_viewer_outbound() {
 	.to_packet();
 	assert_eq!(packet.0.content(), format!(r#"streamsignaling clid=1 id={} json={{"cmd":"answer","args":{{"answer":"v=0\\r\\na=x:\p\/\\\\s\sspace"}}}}"#, STREAM_ID).as_bytes());
 }
+
+#[test]
+fn stream_join_request_from_viewer() {
+	// Wire shape from the broadcaster capture (§9b.2): msg present but valueless.
+	for (is_remove, flag) in [(false, "0"), (true, "1")] {
+		let msg = parse_msg(&format!(
+			"notifyjoinstreamrequest clid=2 id={} msg is_remove={}",
+			STREAM_ID, flag
+		));
+		if let InMessage::JoinStreamRequest(list) = msg {
+			let part = list.iter().next().unwrap();
+			assert_eq!(part.client_id, ts_bookkeeping::ClientId(2));
+			assert_eq!(part.stream_id, STREAM_ID);
+			assert_eq!(part.message.as_deref(), Some(""));
+			assert_eq!(part.is_remove, is_remove);
+		} else {
+			panic!("Expected JoinStreamRequest, got {:?}", msg);
+		}
+	}
+}
+
+#[test]
+fn stream_broadcaster_outbound() {
+	use ts_bookkeeping::ClientId;
+	use ts_bookkeeping::messages::{OutMessageTrait, c2s};
+
+	let packet = c2s::OutSetupStreamPart {
+		name: Some("Bot Stream".into()),
+		stream_type: Some(2),
+		mode: Some(1),
+		bitrate: Some(750000),
+		viewer_limit: Some(0),
+		audio: Some(false),
+		accessibility: 1,
+	}
+	.to_packet();
+	assert_eq!(
+		packet.0.content(),
+		br"setupstream name=Bot\sStream type=2 mode=1 bitrate=750000 viewer_limit=0 audio=0 accessibility=1"
+	);
+	// Everything but accessibility is optional.
+	let packet = c2s::OutSetupStreamPart {
+		name: None,
+		stream_type: None,
+		mode: None,
+		bitrate: None,
+		viewer_limit: None,
+		audio: None,
+		accessibility: 1,
+	}
+	.to_packet();
+	assert_eq!(packet.0.content(), b"setupstream accessibility=1");
+
+	let packet = c2s::OutUpdateStreamPart {
+		stream_id: STREAM_ID.into(),
+		name: Some("Renamed".into()),
+		stream_type: None,
+		mode: None,
+		bitrate: None,
+		viewer_limit: None,
+		audio: None,
+		accessibility: None,
+	}
+	.to_packet();
+	assert_eq!(packet.0.content(), format!("updatestream id={} name=Renamed", STREAM_ID).as_bytes());
+
+	let packet = c2s::OutStopStreamPart { stream_id: STREAM_ID.into(), reason: 1 }.to_packet();
+	assert_eq!(packet.0.content(), format!("stopstream id={} reason=1", STREAM_ID).as_bytes());
+
+	let packet = c2s::OutRespondJoinStreamRequestPart {
+		client_id: ClientId(2),
+		stream_id: STREAM_ID.into(),
+		decision: 1,
+		message: "".into(),
+		offer: "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\na=x:|/\\s\r\n".into(),
+	}
+	.to_packet();
+	assert_eq!(
+		packet.0.content(),
+		format!(
+			r"respondjoinstreamrequest clid=2 id={} decision=1 msg offer=v=0\r\no=-\s1\s2\sIN\sIP4\s127.0.0.1\r\na=x:\p\/\\s\r\n",
+			STREAM_ID
+		)
+		.as_bytes()
+	);
+
+	let packet = c2s::OutRemoveClientFromStreamPart {
+		client_id: ClientId(2),
+		stream_id: STREAM_ID.into(),
+		reason: 4,
+	}
+	.to_packet();
+	assert_eq!(
+		packet.0.content(),
+		format!("removeclientfromstream clid=2 id={} reason=4", STREAM_ID).as_bytes()
+	);
+}
